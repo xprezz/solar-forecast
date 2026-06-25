@@ -1,0 +1,44 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Solar Forecast",
+        "description": "Set up a weather-driven PV production forecast.",
+        "data": {
+          "name": "Name",
+          "latitude": "Latitude",
+          "longitude": "Longitude",
+          "production_entity": "Cumulative production sensor (kWh, lifetime total)",
+          "daily_energy_entity": "Daily production sensor (resets to 0 each midnight)",
+          "negative_price_entity": "Negative-price export-stop entity (optional)",
+          "home_kwh": "Average daily home consumption (kWh)",
+          "car_kwh": "Average daily EV charging (kWh)",
+          "battery_kwh": "Home battery capacity (kWh)",
+          "refit_interval_days": "Auto-refit interval (days)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "A Solar Forecast for this location is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Solar Forecast options",
+        "data": {
+          "name": "Name",
+          "latitude": "Latitude",
+          "longitude": "Longitude",
+          "production_entity": "Cumulative production sensor (kWh, lifetime total)",
+          "daily_energy_entity": "Daily production sensor",
+          "negative_price_entity": "Negative-price export-stop entity",
+          "home_kwh": "Average daily home consumption (kWh)",
+          "car_kwh": "Average daily EV charging (kWh)",
+          "battery_kwh": "Home battery capacity (kWh)",
+          "refit_interval_days": "Auto-refit interval (days)"
+        }
+      }
+    }
+  }
+}

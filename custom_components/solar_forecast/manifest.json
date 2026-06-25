@@ -1,0 +1,13 @@
+{
+  "domain": "solar_forecast",
+  "name": "Solar Forecast",
+  "version": "1.1.0",
+  "documentation": "https://github.com/xprezz/solar-forecast",
+  "issue_tracker": "https://github.com/xprezz/solar-forecast/issues",
+  "codeowners": ["@xprezz"],
+  "config_flow": true,
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "dependencies": [],
+  "after_dependencies": ["recorder"]
+}

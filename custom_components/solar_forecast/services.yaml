@@ -1,0 +1,65 @@
+refit:
+  name: Refit model
+  description: >
+    Re-fit the linear forecast model from accumulated history. Normally this
+    happens automatically every `refit_interval_days`, but you can trigger it
+    manually after importing history or when you want to retune immediately.
+
+collect:
+  name: Collect actual production
+  description: >
+    Record yesterday's actual production into history. Runs automatically at
+    00:05 daily; this service is for backfilling.
+  fields:
+    date:
+      name: Date
+      description: Date in YYYY-MM-DD format. Defaults to yesterday.
+      example: "2026-06-20"
+      selector:
+        date:
+
+import_history:
+  name: Import historical production
+  description: >
+    Bulk-import historical daily production records. Used to bootstrap the
+    integration with pre-existing data. Triggers an immediate refit afterwards.
+
+    Call with NO arguments to load the bundled /config/bootstrap_history.json
+    (382 days of cleaned production shipped with this integration).
+  fields:
+    history:
+      name: History (optional)
+      description: >
+        List of `{date: YYYY-MM-DD, actual_kwh: float}` entries.
+        Leave empty to load from /config/bootstrap_history.json.
+      example: '[{"date": "2025-06-01", "actual_kwh": 23.9}]'
+      required: false
+      selector:
+        object:
+    file:
+      name: File path (optional)
+      description: >
+        Path to a JSON file containing the history list.
+        Defaults to /config/bootstrap_history.json.
+      example: "/config/bootstrap_history.json"
+      required: false
+      selector:
+        text:
+
+backfill_hourly_actuals:
+  name: Backfill hourly actual curves
+  description: >
+    For recent days that have a daily total but no per-hour breakdown, query
+    the recorder and fill in the hourly_actual_kwh curve so the card can show
+    them on the chart. Runs automatically 30 seconds after startup.
+  fields:
+    days:
+      name: Days back
+      description: How many days back to scan. Defaults to 30.
+      example: 30
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 365
+          mode: box
