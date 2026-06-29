@@ -175,32 +175,57 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
 
     def _tips(self, cls: str, alloc: dict, pred: float, tomorrow: float | None,
               cloud: float, precip: float) -> list[str]:
+        """Price- and battery-aware advice. Generic across households (no EV/heat-pump assumptions).
+
+        Logic:
+          - Evening peak (~17-21) is typically the most expensive hour bracket.
+          - Midday (10-15) on bright days is when negative prices and grid-throttling cluster.
+          - The battery is the main lever: store cheap/solar energy, discharge into the peak.
+        """
         tips = []
+        battery = float(self.cfg.get(CONF_BATTERY_KWH, DEFAULT_BATTERY_KWH))
         if cls == "surplus":
-            tips.append(f"Schedule EV around midday — ~{alloc['car_from_solar']:.1f} kWh covered by sun.")
+            tips.append(
+                f"Strong solar (~{pred:.0f} kWh). Battery should fill by mid-morning; "
+                "hold the rest for the evening price peak."
+            )
             if alloc["export_kwh"] > 5:
-                tips.append(f"~{alloc['export_kwh']:.1f} kWh surplus after battery full — run heat pump/wash/dryer in afternoon "
-                            "to avoid negative-price throttling.")
-            if tomorrow is not None and tomorrow < self.cfg.get(CONF_HOME_KWH, DEFAULT_HOME_KWH):
-                tips.append("Tomorrow looks weak — let battery finish today fully charged.")
+                tips.append(
+                    f"~{alloc['export_kwh']:.0f} kWh likely to export. Watch midday spot prices — "
+                    "if negative, run flexible loads 11-15 or pre-charge to avoid throttling."
+                )
+            tips.append(
+                "Plan battery discharge during the evening peak (~17-21) for best sell price."
+            )
+            if tomorrow is not None and tomorrow < 20:
+                tips.append("Tomorrow looks weak — leave battery topped up tonight.")
         elif cls == "good":
-            tips.append(f"Solar covers home + most of EV (~{alloc['home_direct']+alloc['car_from_solar']:.1f} kWh direct).")
+            tips.append(
+                f"Decent solar (~{pred:.0f} kWh). Should cover home base load and refill battery."
+            )
             if alloc["to_battery"] > 5:
-                tips.append(f"Battery refills by ~{alloc['to_battery']:.1f} kWh; should cover the evening.")
+                tips.append(
+                    f"Battery refills by ~{alloc['to_battery']:.0f} kWh — discharge it through "
+                    "the evening peak instead of letting it sit overnight."
+                )
         elif cls == "modest":
-            tips.append(f"Solar covers daytime home + ~{alloc['car_from_solar']:.1f} kWh on EV.")
-            tips.append(f"Top up EV overnight at cheap hours (~{alloc['from_grid_overnight']:.1f} kWh from grid).")
-            if tomorrow is not None and tomorrow >= 40:
-                tips.append("Tomorrow is strong — you can drain the battery harder tonight.")
+            tips.append(
+                f"Modest solar (~{pred:.0f} kWh). Battery may not fully refill from solar today."
+            )
+            tips.append(
+                "Save remaining battery for the evening peak; top up overnight at the cheapest hours."
+            )
         else:
-            tips.append(f"Only ~{pred:.1f} kWh expected; battery + grid will cover most.")
-            tips.append(f"Schedule EV + heavy loads at cheapest overnight hours (~{alloc['from_grid_overnight']:.1f} kWh likely from grid).")
+            tips.append(
+                f"Low production (~{pred:.0f} kWh). Most of the day will come from battery + grid."
+            )
+            tips.append(
+                "Charge battery overnight at cheap hours; discharge into the evening peak."
+            )
             if tomorrow is not None and tomorrow >= 40:
-                tips.append("Tomorrow looks great — keep EV at commuter minimum, let solar finish it.")
+                tips.append("Tomorrow looks strong — you can drain battery harder tonight.")
         if precip > 5:
-            tips.append(f"Heavy rain ({precip:.1f} mm) — clouds may make production noisier.")
-        if cloud > 80 and pred > 20:
-            tips.append("Heavy cloud but decent forecast — diffuse light is significant in summer.")
+            tips.append(f"Heavy rain ({precip:.0f} mm) — production noisier than the headline suggests.")
         return tips
 
     # ---------- main update ----------

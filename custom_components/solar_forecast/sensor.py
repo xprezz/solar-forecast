@@ -292,18 +292,35 @@ class SolarForecastDailyLog(_BaseSensor):
     @property
     def extra_state_attributes(self):
         from .const import ACCURACY_CUTOFF_DATE
+        from datetime import date as _date
         data = self.coordinator.data or {}
         log = data.get("daily_log") or []
-        # Compute accuracy for the last 14 days where both exist AND date >= cutoff
-        cutoff_entries = [r for r in log if r.get("date", "") >= ACCURACY_CUTOFF_DATE]
-        last14 = [r for r in cutoff_entries[-14:] if r.get("predicted") is not None and r.get("actual") is not None]
-        mape = None
+        today_iso = _date.today().isoformat()
+        # Use last 7 *complete* days: date < today AND date >= cutoff AND both predicted+actual present.
+        # Today is intentionally excluded — partial-day actuals create huge spurious MAPE in the morning.
+        complete = [
+            r for r in log
+            if r.get("date", "") >= ACCURACY_CUTOFF_DATE
+            and r.get("date", "") < today_iso
+            and r.get("predicted") is not None
+            and r.get("actual") is not None
+        ]
+        last7 = complete[-7:]
+        mape7 = None
+        if last7:
+            mape7 = round(sum(
+                abs(r["actual"] - r["predicted"]) / max(0.1, r["actual"]) for r in last7
+            ) / len(last7) * 100, 1)
+        # keep legacy 14-day-but-cutoff for backward compat (older cards), also excluding today
+        last14 = complete[-14:]
+        mape14 = None
         if last14:
-            mape = round(sum(
+            mape14 = round(sum(
                 abs(r["actual"] - r["predicted"]) / max(0.1, r["actual"]) for r in last14
             ) / len(last14) * 100, 1)
         return {
             "entries": log,
             "days_logged": len(log),
-            "mape_pct_last_14d": mape,
+            "mape_pct_last_7d_complete": mape7,
+            "mape_pct_last_14d": mape14,
         }
