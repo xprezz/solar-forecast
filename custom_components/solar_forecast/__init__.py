@@ -10,11 +10,37 @@ from homeassistant.helpers import event as ev_helpers
 
 from .const import (
     DOMAIN, PLATFORMS, CONF_REFIT_DAYS, DEFAULT_REFIT_DAYS,
-    CONF_PRODUCTION_ENTITY, CONF_DAILY_ENERGY_ENTITY,
+    CONF_PRODUCTION_ENTITY, CONF_DAILY_ENERGY_ENTITY, CONF_SENSOR_KIND,
 )
 from .coordinator import SolarForecastCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# Legacy keys that may be present in v1 entries — strip on migration to v2.
+_LEGACY_KEYS = (
+    "home_kwh", "car_kwh", "battery_kwh", "negative_price_entity",
+    "soc_entity", "price_entity",
+)
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Migrate config entries from v1 (household-aware) to v2 (forecast-only)."""
+    if entry.version >= 2:
+        return True
+    _LOGGER.info("Migrating Solar Forecast entry from v%s to v2", entry.version)
+    new_data = {k: v for k, v in entry.data.items() if k not in _LEGACY_KEYS}
+    new_options = {k: v for k, v in entry.options.items() if k not in _LEGACY_KEYS}
+    # Infer sensor_kind for upgraders so the new code paths "just work"
+    if CONF_SENSOR_KIND not in new_data and CONF_SENSOR_KIND not in new_options:
+        if new_data.get(CONF_PRODUCTION_ENTITY) or new_options.get(CONF_PRODUCTION_ENTITY):
+            new_data[CONF_SENSOR_KIND] = "cumulative"
+        elif new_data.get(CONF_DAILY_ENERGY_ENTITY) or new_options.get(CONF_DAILY_ENERGY_ENTITY):
+            new_data[CONF_SENSOR_KIND] = "daily"
+        else:
+            new_data[CONF_SENSOR_KIND] = "none"
+    hass.config_entries.async_update_entry(entry, data=new_data, options=new_options, version=2)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -26,6 +52,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # One-shot bootstrap: on a fresh install with a production sensor, scan the
+    # recorder + Open-Meteo archive in the background to train the model.
+    cfg = {**entry.data, **entry.options}
+    if (
+        coordinator._model is None
+        and not coordinator._bootstrap_done
+        and cfg.get(CONF_SENSOR_KIND, "none") != "none"
+    ):
+        async def _kickoff_bootstrap(_now):
+            try:
+                await coordinator.async_bootstrap_from_recorder()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Bootstrap from recorder failed: %s", err)
+        entry.async_on_unload(
+            ev_helpers.async_call_later(hass, 60, _kickoff_bootstrap)
+        )
 
     # Daily collection: every day at 00:05 local, record yesterday's actual production
     async def _daily_collect(now):
@@ -93,10 +136,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await coordinator.async_request_refresh()
         _LOGGER.info("backfill_hourly_actuals: filled %d days", n)
 
+    async def _svc_bootstrap(call: ServiceCall):
+        # Force re-run of the bootstrap scan (useful after changing sensors)
+        coordinator._bootstrap_done = False
+        summary = await coordinator.async_bootstrap_from_recorder()
+        _LOGGER.info("bootstrap: %s", summary)
+
     hass.services.async_register(DOMAIN, "refit", _svc_refit)
     hass.services.async_register(DOMAIN, "collect", _svc_collect)
     hass.services.async_register(DOMAIN, "import_history", _svc_import)
     hass.services.async_register(DOMAIN, "backfill_hourly_actuals", _svc_backfill_hourly)
+    hass.services.async_register(DOMAIN, "bootstrap", _svc_bootstrap)
 
     # Run a one-shot hourly-actuals backfill shortly after startup so the card
     # has past-day curves for recent days that pre-dated the hourly storage.

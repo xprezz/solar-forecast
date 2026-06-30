@@ -1,22 +1,24 @@
 # Solar Forecast
 
-Home Assistant integration that turns Open‑Meteo radiation forecasts into a
-self‑recalibrating daily PV production prediction, using your own inverter
-history to keep the model honest.
+A Home Assistant integration that turns [Open-Meteo](https://open-meteo.com/)
+radiation forecasts into a self-calibrating daily PV production prediction.
+
+If you have a production sensor with several months of history it trains a
+linear model on **your** inverter, refines it weekly, and tells you each day
+how far the forecast was off. If you don't, it ships a physics-based fallback
+based on panel kWp + tilt + azimuth so you get something useful on day one.
+
+Pairs with [`solar-forecast-card`](https://github.com/xprezz/solar-forecast-card)
+for the dashboard, but works fine with the built-in sensor cards too.
 
 ## Features
 
-- 7‑day daily kWh forecast + hourly kW curve (Open‑Meteo)
-- Compares predicted vs actual every day; rolling MAPE accuracy metric
-- Automatic linear refit against your own history (no fixed kWp guess)
-- Surplus / good / modest / low “strategy” classes per day with tips
-- Stores hourly predicted + actual curves for past days (scrollback in the card)
-- Backfills weather + hourly actuals on startup; manual service available
-- Negative‑price awareness (optional binary_sensor input)
-
-Designed to be paired with the
-[`solar-forecast-card`](https://github.com/xprezz/solar-forecast-card)
-Lovelace card, but works fine with the plain HA dashboard too.
+- 7-day daily kWh + hourly kW forecast (Open-Meteo)
+- Forecast accuracy tracking (rolling 7-day MAPE, last-complete days only)
+- Three onboarding paths — see below
+- Automatic weekly refit against your accumulated history
+- Hourly actuals stored for past days so the card can scrollback
+- Zero personal/household assumptions — purely forecast + accuracy
 
 ## Install via HACS
 
@@ -26,40 +28,77 @@ Lovelace card, but works fine with the plain HA dashboard too.
 4. Restart Home Assistant
 5. Settings → Devices & Services → **Add Integration** → *Solar Forecast*
 
-## Configuration
+## Onboarding — pick whichever fits
 
-In the config flow:
+The setup wizard asks one question first: **do you have a PV production sensor?**
 
-| Field | Meaning |
-| --- | --- |
-| Latitude / Longitude | Your site (defaults to HA home) |
-| Production entity | Your inverter's cumulative kWh sensor (preferred) |
-| Daily energy entity | Optional daily kWh sensor |
-| Home / Car / Battery kWh | Sizing for the strategy classifier |
-| Refit interval (days) | How often the linear model is re‑fit (default 7) |
-| Negative price entity | Optional binary_sensor — flips card to “avoid running” mode |
+### Option A — “No sensor”, physics fallback
+Enter your total installed kWp, panel tilt and azimuth. The integration uses
+a simplified physics model (`kWh ≈ kWp × GHI × derating × tilt_az_factor`)
+to predict production. Forecast accuracy is naturally limited but it works
+from minute one, and you can add a sensor later in the options.
 
-## Sensors created
+### Option B — Cumulative kWh sensor (lifetime counter)
+Point the integration at your inverter's lifetime energy sensor (`solis_pv_total_energy_generation`, `growatt_total_energy`, etc).
+60 seconds after setup it will scan Home Assistant's recorder for the past
+`bootstrap_days` (default 365) of daily totals, pull matching radiation from
+the Open-Meteo archive, and fit your personal model.
 
-- `sensor.<name>_today`, `sensor.<name>_tomorrow` – daily kWh predicted
-- `sensor.<name>_7_day_total` – weekly outlook + `per_day_kwh` / `per_day_weather`
-- `sensor.<name>_forecast_peak_power` – kW peak today
-- `sensor.<name>_strategy_today`, `sensor.<name>_strategy_tomorrow`
-- `sensor.<name>_model_rmse` – current fit quality
-- `sensor.<name>_hourly_forecast` – 7‑day hourly arrays
-- `sensor.<name>_today_actual` – production so far today vs prediction
-- `sensor.<name>_daily_log` – full historical log + 14‑day MAPE (since cutoff)
+You do **not** need to enter panel specs — the regression learns the
+effective shape, which is the right answer for multi-string / multi-azimuth
+installs where a single tilt/azimuth pair can't represent reality.
+
+### Option C — Daily kWh sensor (resets each midnight)
+Same as B but for sensors that reset to 0 at midnight. The recorder bootstrap
+pairs each day's *peak* value with that day's radiation total.
+
+### Option D — Bulk import a CSV / JSON
+If you have spreadsheet data from before Home Assistant was recording, call:
+
+```yaml
+service: solar_forecast.import_history
+data:
+  history:
+    - { date: "2024-01-01", actual_kwh: 12.3 }
+    - { date: "2024-01-02", actual_kwh: 18.7 }
+    # ...
+```
+
+Or drop a JSON file at `/config/bootstrap_history.json` and call the service
+with no arguments. A refit fires automatically.
 
 ## Services
 
-- `solar_forecast.refit` – force a model refit from current history
-- `solar_forecast.collect_yesterday` – manually capture yesterday's actual
-- `solar_forecast.import_history` – import a CSV / JSON daily history
-- `solar_forecast.backfill_hourly_actuals` – rebuild past hourly curves from recorder
+| Service | What it does |
+|---|---|
+| `solar_forecast.refit` | Force-refit the model from current history |
+| `solar_forecast.collect` | Record a day's actual production (defaults to yesterday) |
+| `solar_forecast.import_history` | Bulk import historical `(date, actual_kwh)` pairs |
+| `solar_forecast.bootstrap` | Re-run the recorder scan + refit |
+| `solar_forecast.backfill_hourly_actuals` | Fill the per-hour curve for past days |
 
-## Accuracy
+## Sensors
 
-MAPE is computed only from days where both a prediction and an actual exist
-*and* the date is on or after the cutoff (default `2025‑06‑22`), so that
-imported historical actuals without corresponding predictions don't artificially
-deflate the metric.
+| Entity | Purpose |
+|---|---|
+| `sensor.<name>_today` | Predicted kWh today |
+| `sensor.<name>_tomorrow` | Predicted kWh tomorrow |
+| `sensor.<name>_7_day_total` | Weekly forecast total |
+| `sensor.<name>_forecast_peak_power` | Peak instantaneous kW (& time) over the next 7 days |
+| `sensor.<name>_today_actual` | Cumulative actuals so far today |
+| `sensor.<name>_hourly_forecast` | 168-hour predicted + actual arrays (chart fuel) |
+| `sensor.<name>_daily_log` | Rolling log of (predicted, actual) + 7-day MAPE |
+| `sensor.<name>_model_rmse` | Current model RMSE / R² / training-day count |
+
+## Notes
+
+- The model retrains automatically every `refit_interval_days` (default 7)
+  using ordinary least-squares with an inline 1.3× RMSE outlier filter that
+  drops snow-day / grid-throttle anomalies.
+- Today's value is intentionally excluded from the rolling MAPE — partial-day
+  actuals create huge spurious morning errors otherwise.
+- Forecast updates: every 3 hours. Actuals re-read: every 5 minutes.
+
+## License
+
+MIT

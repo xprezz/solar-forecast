@@ -2,15 +2,20 @@
 
 Handles:
   - Pulling Open-Meteo daily + hourly forecasts.
-  - Applying the calibrated linear model to predict kWh.
+  - Predicting kWh from radiation using either:
+      * the learned linear model (kWh = a + b·GHI), or
+      * a physics-derived fallback based on panel kWp + tilt + azimuth
+        for first-run installs with no production history.
   - Persisting prediction/actual history in HA storage.
-  - Self-recalibrating the model from accumulated history.
-  - Computing day-by-day battery/home/car/EV strategy advice.
+  - Self-recalibrating from accumulated history (refit on a schedule).
+  - One-shot bootstrap that scans HA's recorder + Open-Meteo archive
+    on first run when a production sensor is configured.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -23,31 +28,41 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    DOMAIN, STORAGE_KEY, STORAGE_VERSION, OPENMETEO_FORECAST, MJ_TO_WH,
+    DOMAIN, STORAGE_KEY, STORAGE_VERSION, OPENMETEO_FORECAST, OPENMETEO_ARCHIVE, MJ_TO_WH,
     CONF_LATITUDE, CONF_LONGITUDE,
-    CONF_PRODUCTION_ENTITY, CONF_DAILY_ENERGY_ENTITY,
-    CONF_HOME_KWH, CONF_CAR_KWH, CONF_BATTERY_KWH,
-    CONF_REFIT_DAYS, CONF_NEG_PRICE_ENTITY,
-    DEFAULT_HOME_KWH, DEFAULT_CAR_KWH, DEFAULT_BATTERY_KWH, DEFAULT_REFIT_DAYS,
-    MIN_TRAINING_DAYS, RESID_THRESHOLD_RMSE_MULT,
+    CONF_PRODUCTION_ENTITY, CONF_DAILY_ENERGY_ENTITY, CONF_SENSOR_KIND,
+    CONF_PANEL_KWP, CONF_TILT, CONF_AZIMUTH,
+    CONF_REFIT_DAYS, CONF_BOOTSTRAP_DAYS,
+    DEFAULT_PANEL_KWP, DEFAULT_TILT, DEFAULT_AZIMUTH,
+    DEFAULT_REFIT_DAYS, DEFAULT_BOOTSTRAP_DAYS,
+    MIN_TRAINING_DAYS, RESID_THRESHOLD_RMSE_MULT, PV_DERATING,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-# Pre-trained coefficients from 346 days of Storkebakken history (rad_only_clean).
-# Used as initial values until enough local data accumulates.
-DEFAULT_COEF = {
-    "intercept": -2.8172,
-    "slope": 0.009912,
-    "rmse": 3.72,
-    "r2": 0.977,
-    "trained_on": 346,
-    "trained_at": "2026-06-20",
-}
+
+def _tilt_azimuth_factor(tilt_deg: float, azimuth_deg: float, latitude_deg: float) -> float:
+    """Rough efficiency factor relative to GHI-on-horizontal.
+
+    Compares the panel's effective irradiance over a typical day to flat-plate GHI,
+    using a simplified cosine-projection toward solar noon at the equinox sun-altitude.
+    Returns ~1.0 for an optimally-tilted south-facing panel at mid-latitudes,
+    lower for off-axis orientations or extreme tilts.
+
+    This is intentionally a rough heuristic — once we have real production data
+    the regression model takes over and replaces this entirely.
+    """
+    # Optimum tilt rule of thumb: ~ latitude. Penalise deviation linearly.
+    tilt_opt = abs(latitude_deg)
+    tilt_pen = max(0.0, 1.0 - 0.005 * abs(tilt_deg - tilt_opt))  # 1% per 2° off
+    # Azimuth: 180° (south) is best in northern hemisphere; cos falloff away from south
+    az_offset = abs(((azimuth_deg - 180.0 + 180.0) % 360.0) - 180.0)
+    az_pen = max(0.3, math.cos(math.radians(az_offset)))  # never less than 0.3 (diffuse)
+    return tilt_pen * az_pen
 
 
 class SolarForecastCoordinator(DataUpdateCoordinator):
-    """Polls Open-Meteo, applies model, computes strategy."""
+    """Polls Open-Meteo and applies the calibrated (or physics-default) model."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry):
         super().__init__(
@@ -57,8 +72,12 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self._store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}")
         self._history: dict[str, dict] = {}      # date_iso -> {actual, predicted, ghi}
-        self._model: dict = dict(DEFAULT_COEF)
+        # Model is None until either bootstrap or refit fills it. Until then,
+        # predictions come from the physics fallback (panel kWp + tilt + azimuth).
+        self._model: dict | None = None
         self._last_refit: str | None = None
+        self._bootstrap_done: bool = False
+        self._bootstrap_summary: dict | None = None
 
     @property
     def cfg(self) -> dict[str, Any]:
@@ -68,8 +87,10 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
     async def async_load_storage(self):
         data = await self._store.async_load() or {}
         self._history = data.get("history", {})
-        self._model = data.get("model", dict(DEFAULT_COEF))
+        self._model = data.get("model")  # may be None for fresh installs
         self._last_refit = data.get("last_refit")
+        self._bootstrap_done = bool(data.get("bootstrap_done", False))
+        self._bootstrap_summary = data.get("bootstrap_summary")
         # One-time cleanup: drop hourly_actual_kwh arrays where hour 0 holds a phantom
         # pre-reset spike (pre-1.2.1 bug). Triggers re-backfill on next update.
         cleaned = 0
@@ -85,7 +106,7 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
         if cleaned:
             _LOGGER.info("Cleared %d corrupted hourly_actual_kwh arrays (phantom spike at hour 0)", cleaned)
             await self._save_storage()
-        _LOGGER.info("Loaded %d historical days, model %s", len(self._history), self._model)
+        _LOGGER.info("Loaded %d historical days, model=%s", len(self._history), self._model)
 
     async def async_backfill_hourly_actuals(self, days_back: int = 30) -> int:
         """Backfill hourly_actual_kwh for recent days that have a daily total
@@ -127,6 +148,8 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
             "history": self._history,
             "model": self._model,
             "last_refit": self._last_refit,
+            "bootstrap_done": self._bootstrap_done,
+            "bootstrap_summary": self._bootstrap_summary,
         })
 
     # ---------- Open-Meteo fetch ----------
@@ -157,99 +180,39 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Open-Meteo fetch failed: {err}") from err
 
     # ---------- model application ----------
-    def _predict_kwh(self, ghi_wh_m2: float) -> float:
-        return max(0.0, self._model["intercept"] + self._model["slope"] * ghi_wh_m2)
+    def _physics_coeffs(self) -> tuple[float, float]:
+        """Return (intercept, slope) for the physics fallback model.
 
-    def _classify(self, pred: float, home: float, car: float) -> str:
-        if pred >= 40: return "surplus"
-        if pred >= home + car: return "good"
-        if pred >= home: return "modest"
-        return "low"
+        kWh_day ≈ kWp × GHI(Wh/m²) / 1000 × derating × tilt_az_factor
+        So slope = kWp/1000 × derating × tilt_az_factor and intercept = 0.
+        """
+        cfg = self.cfg
+        kwp = float(cfg.get(CONF_PANEL_KWP, DEFAULT_PANEL_KWP))
+        tilt = float(cfg.get(CONF_TILT, DEFAULT_TILT))
+        az = float(cfg.get(CONF_AZIMUTH, DEFAULT_AZIMUTH))
+        lat = float(cfg.get(CONF_LATITUDE, 0.0))
+        f = _tilt_azimuth_factor(tilt, az, lat)
+        slope = (kwp / 1000.0) * PV_DERATING * f
+        return 0.0, slope
 
-    def _allocate(self, pred: float, home: float, car: float, battery: float, soc: float):
-        daytime_home = home * 0.5
-        evening_home = home * 0.5
-        rem = pred
-        home_direct = min(daytime_home, rem); rem -= home_direct
-        car_from_solar = min(car, rem); rem -= car_from_solar
-        to_battery = min(battery - soc, max(0.0, rem)); rem -= to_battery
-        export_kwh = max(0.0, rem)
-        soc_new = soc + to_battery
-        car_remaining = car - car_from_solar
-        from_battery = min(soc_new, evening_home + car_remaining)
-        soc_new -= from_battery
-        from_grid = max(0.0, evening_home + car_remaining - from_battery)
+    def _active_model(self) -> dict:
+        """Return the current effective model dict (learned or physics)."""
+        if self._model and "slope" in self._model:
+            return self._model
+        a, b = self._physics_coeffs()
         return {
-            "home_direct": round(home_direct, 1),
-            "car_from_solar": round(car_from_solar, 1),
-            "to_battery": round(to_battery, 1),
-            "export_kwh": round(export_kwh, 1),
-            "soc_end": round(soc_new, 1),
-            "from_grid_overnight": round(from_grid, 1),
+            "intercept": a, "slope": b, "source": "physics",
+            "panel_kwp": float(self.cfg.get(CONF_PANEL_KWP, DEFAULT_PANEL_KWP)),
+            "tilt": float(self.cfg.get(CONF_TILT, DEFAULT_TILT)),
+            "azimuth": float(self.cfg.get(CONF_AZIMUTH, DEFAULT_AZIMUTH)),
         }
 
-    def _tips(self, cls: str, alloc: dict, pred: float, tomorrow: float | None,
-              cloud: float, precip: float) -> list[str]:
-        """Price- and battery-aware advice. Generic across households (no EV/heat-pump assumptions).
-
-        Logic:
-          - Evening peak (~17-21) is typically the most expensive hour bracket.
-          - Midday (10-15) on bright days is when negative prices and grid-throttling cluster.
-          - The battery is the main lever: store cheap/solar energy, discharge into the peak.
-        """
-        tips = []
-        battery = float(self.cfg.get(CONF_BATTERY_KWH, DEFAULT_BATTERY_KWH))
-        if cls == "surplus":
-            tips.append(
-                f"Strong solar (~{pred:.0f} kWh). Battery should fill by mid-morning; "
-                "hold the rest for the evening price peak."
-            )
-            if alloc["export_kwh"] > 5:
-                tips.append(
-                    f"~{alloc['export_kwh']:.0f} kWh likely to export. Watch midday spot prices — "
-                    "if negative, run flexible loads 11-15 or pre-charge to avoid throttling."
-                )
-            tips.append(
-                "Plan battery discharge during the evening peak (~17-21) for best sell price."
-            )
-            if tomorrow is not None and tomorrow < 20:
-                tips.append("Tomorrow looks weak — leave battery topped up tonight.")
-        elif cls == "good":
-            tips.append(
-                f"Decent solar (~{pred:.0f} kWh). Should cover home base load and refill battery."
-            )
-            if alloc["to_battery"] > 5:
-                tips.append(
-                    f"Battery refills by ~{alloc['to_battery']:.0f} kWh — discharge it through "
-                    "the evening peak instead of letting it sit overnight."
-                )
-        elif cls == "modest":
-            tips.append(
-                f"Modest solar (~{pred:.0f} kWh). Battery may not fully refill from solar today."
-            )
-            tips.append(
-                "Save remaining battery for the evening peak; top up overnight at the cheapest hours."
-            )
-        else:
-            tips.append(
-                f"Low production (~{pred:.0f} kWh). Most of the day will come from battery + grid."
-            )
-            tips.append(
-                "Charge battery overnight at cheap hours; discharge into the evening peak."
-            )
-            if tomorrow is not None and tomorrow >= 40:
-                tips.append("Tomorrow looks strong — you can drain battery harder tonight.")
-        if precip > 5:
-            tips.append(f"Heavy rain ({precip:.0f} mm) — production noisier than the headline suggests.")
-        return tips
+    def _predict_kwh(self, ghi_wh_m2: float) -> float:
+        m = self._active_model()
+        return max(0.0, m["intercept"] + m["slope"] * ghi_wh_m2)
 
     # ---------- main update ----------
     async def _async_update_data(self) -> dict:
-        cfg = self.cfg
-        home = float(cfg.get(CONF_HOME_KWH, DEFAULT_HOME_KWH))
-        car = float(cfg.get(CONF_CAR_KWH, DEFAULT_CAR_KWH))
-        battery = float(cfg.get(CONF_BATTERY_KWH, DEFAULT_BATTERY_KWH))
-
         raw = await self._fetch_openmeteo()
         daily = raw["daily"]
         hourly = raw["hourly"]
@@ -283,29 +246,6 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
             self._pending_save_today = True
         else:
             self._pending_save_today = False
-
-        # strategy: simulate battery SoC across 7 days starting at 50%
-        soc = battery * 0.5
-        strategy = []
-        for i, d in enumerate(dates):
-            tomorrow = pred_kwh[i + 1] if i + 1 < len(pred_kwh) else None
-            alloc = self._allocate(pred_kwh[i], home, car, battery, soc)
-            soc = alloc["soc_end"]
-            cls = self._classify(pred_kwh[i], home, car)
-            strategy.append({
-                "date": d,
-                "predicted_kwh": pred_kwh[i],
-                "class": cls,
-                "tips": self._tips(cls, alloc, pred_kwh[i], tomorrow,
-                                   daily["cloud_cover_mean"][i] or 0,
-                                   daily["precipitation_sum"][i] or 0),
-                "allocation": alloc,
-                "cloud_pct": daily["cloud_cover_mean"][i],
-                "precip_mm": daily["precipitation_sum"][i],
-                "temp_min": daily["temperature_2m_min"][i],
-                "temp_max": daily["temperature_2m_max"][i],
-                "weather_code": daily["weather_code"][i],
-            })
 
         # hourly with per-hour kW prediction proportional to radiation share
         hourly_pred_kw = []
@@ -375,8 +315,7 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
             "hourly": hourly,
             "daily_pred_kwh": pred_kwh,
             "hourly_pred_kw": hourly_pred_kw,
-            "strategy": strategy,
-            "model": self._model,
+            "model": self._active_model(),
             "peak_kw": round(peak_kw, 2),
             "peak_time": peak_time,
             "today_pred": pred_kwh[0] if pred_kwh else None,
@@ -875,5 +814,73 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
             count += 1
         await self._save_storage()
         _LOGGER.info("Imported %d historical days", count)
-        # Trigger refit
+        # Backfill weather + fit a model on whatever we got
+        await self._backfill_ghi(sorted(rec_date for rec_date in self._history.keys()))
         await self.async_refit_model(force=True)
+
+    async def async_bootstrap_from_recorder(self) -> dict:
+        """One-shot: scan HA recorder for past production, backfill weather, refit.
+
+        Walks `CONF_BOOTSTRAP_DAYS` days back, reads daily-total kWh from the
+        configured production sensor, pulls matching GHI from the Open-Meteo
+        archive, then fits the linear model. Safe to call repeatedly; will be
+        skipped on subsequent calls via `self._bootstrap_done`.
+        """
+        if self._bootstrap_done:
+            _LOGGER.debug("Bootstrap already complete; skipping")
+            return self._bootstrap_summary or {"skipped": True}
+        cfg = self.cfg
+        if cfg.get(CONF_SENSOR_KIND, "none") == "none":
+            _LOGGER.info("Bootstrap skipped: no production sensor configured")
+            self._bootstrap_done = True
+            self._bootstrap_summary = {"skipped": "no_sensor"}
+            await self._save_storage()
+            return self._bootstrap_summary
+
+        days_back = int(cfg.get(CONF_BOOTSTRAP_DAYS, DEFAULT_BOOTSTRAP_DAYS))
+        today = dt_util.now().date()
+        new_days = 0
+        for offset in range(1, days_back + 1):
+            target = today - timedelta(days=offset)
+            iso = target.isoformat()
+            # Skip days we already have a recorded actual for
+            if self._history.get(iso, {}).get("actual") is not None:
+                continue
+            try:
+                actual = await self._read_actual_for(target)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Bootstrap: read failed for %s: %s", iso, err)
+                continue
+            if actual is None or actual <= 0:
+                continue
+            rec = self._history.get(iso, {})
+            rec["actual"] = round(float(actual), 2)
+            self._history[iso] = rec
+            new_days += 1
+
+        _LOGGER.info("Bootstrap: collected %d new actuals from recorder", new_days)
+
+        # Batch-backfill GHI for any day missing it. The archive endpoint
+        # accepts a date range, so one call covers the lot.
+        missing_ghi = [d for d, r in self._history.items() if r.get("ghi_wh_m2") is None]
+        if missing_ghi:
+            try:
+                await self._backfill_ghi(sorted(missing_ghi))
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Bootstrap: GHI backfill failed: %s", err)
+
+        # Fit the model on whatever we have
+        try:
+            await self.async_refit_model(force=True)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Bootstrap: refit failed: %s", err)
+
+        self._bootstrap_done = True
+        self._bootstrap_summary = {
+            "days_collected": new_days,
+            "total_history_days": len(self._history),
+            "model": self._model,
+        }
+        await self._save_storage()
+        await self.async_request_refresh()
+        return self._bootstrap_summary

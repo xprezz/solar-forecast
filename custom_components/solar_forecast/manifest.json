@@ -1,7 +1,7 @@
 {
   "domain": "solar_forecast",
   "name": "Solar Forecast",
-  "version": "1.2.1",
+  "version": "2.0.0",
   "documentation": "https://github.com/xprezz/solar-forecast",
   "issue_tracker": "https://github.com/xprezz/solar-forecast/issues",
   "codeowners": ["@xprezz"],

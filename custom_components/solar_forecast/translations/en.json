@@ -3,18 +3,25 @@
     "step": {
       "user": {
         "title": "Solar Forecast",
-        "description": "Set up a weather-driven PV production forecast.",
+        "description": "Set up a weather-driven PV production forecast. If you have a production sensor with several months of history, the model will train itself automatically. Otherwise enter your panel specs on the next page.",
         "data": {
           "name": "Name",
           "latitude": "Latitude",
           "longitude": "Longitude",
+          "sensor_kind": "Do you have a PV production sensor?",
           "production_entity": "Cumulative production sensor (kWh, lifetime total)",
           "daily_energy_entity": "Daily production sensor (resets to 0 each midnight)",
-          "negative_price_entity": "Negative-price export-stop entity (optional)",
-          "home_kwh": "Average daily home consumption (kWh)",
-          "car_kwh": "Average daily EV charging (kWh)",
-          "battery_kwh": "Home battery capacity (kWh)",
+          "bootstrap_days": "Days of history to scan for auto-training",
           "refit_interval_days": "Auto-refit interval (days)"
+        }
+      },
+      "panel": {
+        "title": "Panel specs",
+        "description": "Without a production sensor, the forecast uses a physics-based model. Enter the total installed kWp, tilt and azimuth of your panels. Default azimuth 180° = south.",
+        "data": {
+          "panel_kwp": "Total installed power (kWp)",
+          "tilt": "Tilt angle (0 = flat, 90 = vertical)",
+          "azimuth": "Azimuth (0 = N, 90 = E, 180 = S, 270 = W)"
         }
       }
     },
@@ -30,14 +37,24 @@
           "name": "Name",
           "latitude": "Latitude",
           "longitude": "Longitude",
-          "production_entity": "Cumulative production sensor (kWh, lifetime total)",
+          "sensor_kind": "Production sensor type",
+          "production_entity": "Cumulative production sensor (kWh)",
           "daily_energy_entity": "Daily production sensor",
-          "negative_price_entity": "Negative-price export-stop entity",
-          "home_kwh": "Average daily home consumption (kWh)",
-          "car_kwh": "Average daily EV charging (kWh)",
-          "battery_kwh": "Home battery capacity (kWh)",
+          "panel_kwp": "Total installed power (kWp)",
+          "tilt": "Tilt angle",
+          "azimuth": "Azimuth",
+          "bootstrap_days": "Days of history to scan",
           "refit_interval_days": "Auto-refit interval (days)"
         }
+      }
+    }
+  },
+  "selector": {
+    "sensor_kind": {
+      "options": {
+        "none": "No sensor — use panel specs only",
+        "cumulative": "Yes — lifetime total kWh counter",
+        "daily": "Yes — daily kWh that resets at midnight"
       }
     }
   }

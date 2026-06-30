@@ -63,3 +63,13 @@ backfill_hourly_actuals:
           min: 1
           max: 365
           mode: box
+
+bootstrap:
+  name: Bootstrap model from recorder
+  description: >
+    Re-scan Home Assistant's recorder for past production from the configured
+    sensor, pair it with Open-Meteo archive radiation, and retrain the model.
+    Runs automatically 60 seconds after first setup when a production sensor
+    is configured. Call this manually to redo the scan after changing sensors
+    or after backfilling more recorder data.
+

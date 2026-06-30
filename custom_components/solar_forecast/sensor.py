@@ -19,8 +19,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         SolarForecastDailyKwh(coordinator, entry, 1, "Tomorrow"),
         SolarForecastWeekTotal(coordinator, entry),
         SolarForecastPeakPower(coordinator, entry),
-        SolarForecastStrategy(coordinator, entry, 0, "Strategy Today"),
-        SolarForecastStrategy(coordinator, entry, 1, "Strategy Tomorrow"),
         SolarForecastModelInfo(coordinator, entry),
         SolarForecastHourly(coordinator, entry),
         SolarForecastTodayActual(coordinator, entry),
@@ -40,7 +38,7 @@ class _BaseSensor(CoordinatorEntity, SensorEntity):
             name=entry.title,
             manufacturer="Solar Forecast",
             model="Linear weather model",
-            sw_version="1.0.0",
+            sw_version="2.0.0",
         )
 
 
@@ -150,41 +148,6 @@ class SolarForecastPeakPower(_BaseSensor):
         return {"peak_time": data.get("peak_time")}
 
 
-class SolarForecastStrategy(_BaseSensor):
-    _attr_icon = "mdi:lightbulb-on-outline"
-
-    def __init__(self, coordinator, entry, idx: int, label: str):
-        super().__init__(coordinator, entry)
-        self._idx = idx
-        self._attr_name = label
-        self._attr_unique_id = f"{entry.entry_id}_strategy_d{idx}"
-
-    @property
-    def native_value(self):
-        strat = (self.coordinator.data or {}).get("strategy") or []
-        if self._idx < len(strat):
-            return strat[self._idx]["class"]
-        return None
-
-    @property
-    def extra_state_attributes(self):
-        strat = (self.coordinator.data or {}).get("strategy") or []
-        if self._idx >= len(strat):
-            return {}
-        s = strat[self._idx]
-        return {
-            "date": s["date"],
-            "predicted_kwh": s["predicted_kwh"],
-            "tips": s["tips"],
-            "allocation": s["allocation"],
-            "cloud_pct": s.get("cloud_pct"),
-            "precip_mm": s.get("precip_mm"),
-            "temp_min": s.get("temp_min"),
-            "temp_max": s.get("temp_max"),
-            "weather_code": s.get("weather_code"),
-        }
-
-
 class SolarForecastModelInfo(_BaseSensor):
     _attr_icon = "mdi:chart-bell-curve-cumulative"
     _attr_name = "Model RMSE"
@@ -291,17 +254,15 @@ class SolarForecastDailyLog(_BaseSensor):
 
     @property
     def extra_state_attributes(self):
-        from .const import ACCURACY_CUTOFF_DATE
         from datetime import date as _date
         data = self.coordinator.data or {}
         log = data.get("daily_log") or []
         today_iso = _date.today().isoformat()
-        # Use last 7 *complete* days: date < today AND date >= cutoff AND both predicted+actual present.
+        # Use last 7 *complete* days: date < today AND both predicted+actual present.
         # Today is intentionally excluded — partial-day actuals create huge spurious MAPE in the morning.
         complete = [
             r for r in log
-            if r.get("date", "") >= ACCURACY_CUTOFF_DATE
-            and r.get("date", "") < today_iso
+            if r.get("date", "") < today_iso
             and r.get("predicted") is not None
             and r.get("actual") is not None
         ]
