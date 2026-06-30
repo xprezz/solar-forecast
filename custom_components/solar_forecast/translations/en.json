@@ -11,6 +11,8 @@
           "sensor_kind": "Do you have a PV production sensor?",
           "production_entity": "Cumulative production sensor (kWh, lifetime total)",
           "daily_energy_entity": "Daily production sensor (resets to 0 each midnight)",
+          "price_entity": "Sales price sensor (optional, with hourly forecast in attributes)",
+          "throttle_switch": "Production throttle switch/binary_sensor (optional, ON when curtailed)",
           "bootstrap_days": "Days of history to scan for auto-training",
           "refit_interval_days": "Auto-refit interval (days)"
         }
@@ -40,6 +42,8 @@
           "sensor_kind": "Production sensor type",
           "production_entity": "Cumulative production sensor (kWh)",
           "daily_energy_entity": "Daily production sensor",
+          "price_entity": "Sales price sensor",
+          "throttle_switch": "Production throttle switch",
           "panel_kwp": "Total installed power (kWp)",
           "tilt": "Tilt angle",
           "azimuth": "Azimuth",

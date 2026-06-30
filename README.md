@@ -67,6 +67,24 @@ data:
 Or drop a JSON file at `/config/bootstrap_history.json` and call the service
 with no arguments. A refit fires automatically.
 
+## Optional opt-in modules (v2.1+)
+
+These activate **only when you configure the matching entity** — leave them blank to keep the integration forecast-only.
+
+### Sales price sensor
+
+Point at any sensor whose **state** is the current sales price (e.g. `sensor.solar_real_sales_price`, a Nordpool sensor, an Energi Data Service sensor). The integration looks for the hourly forecast in the sensor's attributes, accepting any of:
+
+- `raw_today` / `raw_tomorrow` — Nordpool-style list of `{start, end, value}` (most common in DK).
+- `today` / `tomorrow` — flat list of 24 hourly values, chronological from 00:00.
+- `forecast` / `prices` — same flat-list format.
+
+When configured, you get `sensor.<name>_negative_price_window` with the next contiguous negative-price window (state = hour count, attributes = start/end/min price) and a banner in the card.
+
+### Production throttle switch
+
+A `switch` / `binary_sensor` / `input_boolean` that is **ON** when your inverter is being curtailed (e.g. by your own negative-price automation). The integration tallies on-time using the HA recorder and exposes `sensor.<name>_throttled_minutes_today`, plus a banner in the card so it's clear *why* today's actual is lower than the prediction.
+
 ## Services
 
 | Service | What it does |

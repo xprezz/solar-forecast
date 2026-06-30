@@ -13,6 +13,9 @@ CONF_TILT = "tilt"                                  # 0=flat, 90=vertical
 CONF_AZIMUTH = "azimuth"                            # 0=N, 90=E, 180=S, 270=W
 CONF_REFIT_DAYS = "refit_interval_days"
 CONF_BOOTSTRAP_DAYS = "bootstrap_days"              # how far back to scan recorder on first run
+# Optional opt-in modules (v2.1+)
+CONF_PRICE_ENTITY = "price_entity"                  # sensor with current sell price + hourly forecast
+CONF_THROTTLE_SWITCH = "throttle_switch"            # switch ON when production is being curtailed
 
 # ---- defaults ----
 DEFAULT_TILT = 30.0       # typical Northern-hemisphere roof

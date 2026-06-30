@@ -21,6 +21,7 @@ from .const import (
     CONF_PRODUCTION_ENTITY, CONF_DAILY_ENERGY_ENTITY, CONF_SENSOR_KIND,
     CONF_PANEL_KWP, CONF_TILT, CONF_AZIMUTH,
     CONF_REFIT_DAYS, CONF_BOOTSTRAP_DAYS,
+    CONF_PRICE_ENTITY, CONF_THROTTLE_SWITCH,
     DEFAULT_PANEL_KWP, DEFAULT_TILT, DEFAULT_AZIMUTH,
     DEFAULT_REFIT_DAYS, DEFAULT_BOOTSTRAP_DAYS,
 )
@@ -44,6 +45,12 @@ def _step1_schema(hass, defaults: dict | None = None) -> vol.Schema:
         ),
         vol.Optional(CONF_PRODUCTION_ENTITY, default=d.get(CONF_PRODUCTION_ENTITY, "")): selector.EntitySelector(
             selector.EntitySelectorConfig(domain="sensor")
+        ),
+        vol.Optional(CONF_PRICE_ENTITY, default=d.get(CONF_PRICE_ENTITY, "")): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="sensor")
+        ),
+        vol.Optional(CONF_THROTTLE_SWITCH, default=d.get(CONF_THROTTLE_SWITCH, "")): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain=["switch", "binary_sensor", "input_boolean"])
         ),
     })
 
@@ -71,6 +78,12 @@ def _advanced_schema(defaults: dict | None = None) -> vol.Schema:
         ),
         vol.Required(CONF_BOOTSTRAP_DAYS, default=d.get(CONF_BOOTSTRAP_DAYS, DEFAULT_BOOTSTRAP_DAYS)): vol.All(
             int, vol.Range(min=30, max=1825)
+        ),
+        vol.Optional(CONF_PRICE_ENTITY, default=d.get(CONF_PRICE_ENTITY, "")): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="sensor")
+        ),
+        vol.Optional(CONF_THROTTLE_SWITCH, default=d.get(CONF_THROTTLE_SWITCH, "")): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain=["switch", "binary_sensor", "input_boolean"])
         ),
     })
 

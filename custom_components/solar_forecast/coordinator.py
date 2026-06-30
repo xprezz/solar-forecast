@@ -33,6 +33,7 @@ from .const import (
     CONF_PRODUCTION_ENTITY, CONF_DAILY_ENERGY_ENTITY, CONF_SENSOR_KIND,
     CONF_PANEL_KWP, CONF_TILT, CONF_AZIMUTH,
     CONF_REFIT_DAYS, CONF_BOOTSTRAP_DAYS,
+    CONF_PRICE_ENTITY, CONF_THROTTLE_SWITCH,
     DEFAULT_PANEL_KWP, DEFAULT_TILT, DEFAULT_AZIMUTH,
     DEFAULT_REFIT_DAYS, DEFAULT_BOOTSTRAP_DAYS,
     MIN_TRAINING_DAYS, RESID_THRESHOLD_RMSE_MULT, PV_DERATING,
@@ -308,7 +309,16 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
                 "weather_code": rec.get("weather_code"),
                 "hourly_pred_kw": rec.get("hourly_pred_kw"),
                 "hourly_actual_kwh": rec.get("hourly_actual_kwh"),
+                "throttled_minutes": rec.get("throttled_minutes"),
             })
+
+        # ---- Optional price + throttle modules ----
+        price_info = await self._read_price_info()
+        throttle_info = await self._read_throttle_info()
+        # Persist today's throttled-minutes so daily_log can show it later
+        if throttle_info.get("minutes_today") is not None and today_iso in self._history:
+            self._history[today_iso]["throttled_minutes"] = throttle_info["minutes_today"]
+            await self._save_storage()
 
         return {
             "daily": daily,
@@ -331,6 +341,174 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
             "hourly_times": hourly["time"],
             "hourly_pred_kw_cached": hourly_pred_kw,
             "dates": dates,
+            "price": price_info,
+            "throttle": throttle_info,
+        }
+
+    # ---------- optional modules: price + throttle ----------
+    async def _read_price_info(self) -> dict:
+        """Read current sales price + hourly forecast from the configured sensor.
+
+        Expected sensor contract (any one of these works):
+          - state = current price (numeric, e.g. kr/kWh or øre/kWh).
+          - attributes contain ONE of:
+              * `raw_today` / `raw_tomorrow` as Nordpool-style lists of
+                {start, end, value} (most common in DK setups).
+              * `forecast` or `prices` as a flat list of 24 hourly values
+                (chronological, starting at 00:00 today).
+              * `today` / `tomorrow` as flat lists of 24 hourly values.
+
+        Returns a dict with keys: configured, current, today (list), tomorrow
+        (list), negative_hours_today (count), negative_hours_tomorrow (count),
+        next_negative_window ({start, end, min_price}) or None.
+        """
+        cfg = self.cfg
+        eid = (cfg.get(CONF_PRICE_ENTITY) or "").strip()
+        if not eid:
+            return {"configured": False}
+
+        state = self.hass.states.get(eid)
+        if state is None:
+            return {"configured": True, "available": False}
+
+        def _f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        current = _f(state.state)
+        attrs = state.attributes or {}
+
+        def _from_raw(arr):
+            """Convert a Nordpool-style raw list -> 24 hourly floats keyed by hour."""
+            out = [None] * 24
+            for it in arr or []:
+                start = it.get("start") or it.get("time")
+                val = _f(it.get("value") if "value" in it else it.get("price"))
+                if not start or val is None:
+                    continue
+                try:
+                    h = int(str(start)[11:13])
+                except (ValueError, IndexError):
+                    continue
+                if 0 <= h < 24:
+                    out[h] = val
+            return out
+
+        def _read_day(prefix: str) -> list[float | None]:
+            # Nordpool-style raw_today / raw_tomorrow
+            if f"raw_{prefix}" in attrs:
+                return _from_raw(attrs[f"raw_{prefix}"])
+            # Flat-list variants
+            for key in (prefix, f"{prefix}_prices", "forecast" if prefix == "today" else None, "prices" if prefix == "today" else None):
+                if not key:
+                    continue
+                arr = attrs.get(key)
+                if isinstance(arr, list) and len(arr) >= 24:
+                    return [_f(v) for v in arr[:24]]
+            return [None] * 24
+
+        today_prices = _read_day("today")
+        tomorrow_prices = _read_day("tomorrow")
+        neg_today = sum(1 for v in today_prices if v is not None and v < 0)
+        neg_tomorrow = sum(1 for v in tomorrow_prices if v is not None and v < 0)
+
+        # Find next contiguous negative-price window starting from now
+        now = dt_util.now()
+        next_window = None
+        combined = list(today_prices) + list(tomorrow_prices)  # 48 hours
+        start_h = now.hour
+        i = start_h
+        while i < len(combined):
+            v = combined[i]
+            if v is not None and v < 0:
+                j = i
+                min_p = v
+                while j < len(combined) and combined[j] is not None and combined[j] < 0:
+                    min_p = min(min_p, combined[j])
+                    j += 1
+                # i and j are hours-from-midnight-today; convert to wall time
+                base = now.replace(minute=0, second=0, microsecond=0)
+                start_dt = base.replace(hour=0) + timedelta(hours=i)
+                end_dt = base.replace(hour=0) + timedelta(hours=j)
+                next_window = {
+                    "start": start_dt.isoformat(),
+                    "end": end_dt.isoformat(),
+                    "hours": j - i,
+                    "min_price": round(min_p, 4),
+                }
+                break
+            i += 1
+
+        return {
+            "configured": True,
+            "available": True,
+            "entity_id": eid,
+            "current": current,
+            "today": today_prices,
+            "tomorrow": tomorrow_prices,
+            "negative_hours_today": neg_today,
+            "negative_hours_tomorrow": neg_tomorrow,
+            "next_negative_window": next_window,
+            "unit": attrs.get("unit_of_measurement"),
+        }
+
+    async def _read_throttle_info(self) -> dict:
+        """Read throttle switch state + cumulative minutes-throttled today.
+
+        Returns: configured, active (bool), minutes_today (int), since (iso or None).
+        Uses the recorder to add up "on" durations within today's local window.
+        """
+        cfg = self.cfg
+        eid = (cfg.get(CONF_THROTTLE_SWITCH) or "").strip()
+        if not eid:
+            return {"configured": False, "minutes_today": None}
+
+        state = self.hass.states.get(eid)
+        active = bool(state and state.state == "on")
+
+        # Sum on-time today from the recorder
+        from homeassistant.components.recorder import history, get_instance
+        start = dt_util.start_of_local_day()
+        end = dt_util.now()
+
+        def _get_states():
+            return history.state_changes_during_period(
+                self.hass, start, end, eid, include_start_time_state=True
+            )
+
+        try:
+            states_map = await get_instance(self.hass).async_add_executor_job(_get_states)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Throttle read failed: %s", err)
+            states_map = {}
+
+        entries = states_map.get(eid, [])
+        total_on = timedelta()
+        last_on_ts = None
+        for s in entries:
+            ts = dt_util.as_local(s.last_changed)
+            if ts < start:
+                ts = start
+            if s.state == "on":
+                if last_on_ts is None:
+                    last_on_ts = ts
+            else:
+                if last_on_ts is not None:
+                    total_on += ts - last_on_ts
+                    last_on_ts = None
+        if last_on_ts is not None:
+            total_on += end - last_on_ts
+
+        minutes_today = int(total_on.total_seconds() // 60)
+
+        return {
+            "configured": True,
+            "entity_id": eid,
+            "active": active,
+            "minutes_today": minutes_today,
+            "state": state.state if state else None,
         }
 
     @staticmethod

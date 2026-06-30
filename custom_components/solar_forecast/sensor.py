@@ -24,6 +24,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         SolarForecastTodayActual(coordinator, entry),
         SolarForecastDailyLog(coordinator, entry),
     ]
+    # Optional opt-in sensors — only added when the corresponding entity is configured
+    cfg = {**entry.data, **entry.options}
+    if (cfg.get("price_entity") or "").strip():
+        sensors.append(SolarForecastNegativePriceWindow(coordinator, entry))
+    if (cfg.get("throttle_switch") or "").strip():
+        sensors.append(SolarForecastThrottleMinutesToday(coordinator, entry))
     async_add_entities(sensors)
 
 
@@ -38,7 +44,7 @@ class _BaseSensor(CoordinatorEntity, SensorEntity):
             name=entry.title,
             manufacturer="Solar Forecast",
             model="Linear weather model",
-            sw_version="2.0.0",
+            sw_version="2.1.0",
         )
 
 
@@ -284,4 +290,68 @@ class SolarForecastDailyLog(_BaseSensor):
             "days_logged": len(log),
             "mape_pct_last_7d_complete": mape7,
             "mape_pct_last_14d": mape14,
+        }
+
+
+class SolarForecastNegativePriceWindow(_BaseSensor):
+    """Surfaces the next contiguous negative-price window from the configured price sensor.
+
+    State = number of hours in the next negative window (0 if none upcoming).
+    Attributes expose start/end ISO timestamps and the minimum price.
+    """
+    _attr_icon = "mdi:cash-minus"
+    _attr_name = "Negative price window"
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_negative_price_window"
+
+    @property
+    def native_value(self):
+        p = (self.coordinator.data or {}).get("price") or {}
+        win = p.get("next_negative_window")
+        return win["hours"] if win else 0
+
+    @property
+    def extra_state_attributes(self):
+        p = (self.coordinator.data or {}).get("price") or {}
+        win = p.get("next_negative_window")
+        return {
+            "configured": p.get("configured"),
+            "current_price": p.get("current"),
+            "unit": p.get("unit"),
+            "negative_hours_today": p.get("negative_hours_today"),
+            "negative_hours_tomorrow": p.get("negative_hours_tomorrow"),
+            "window_start": win["start"] if win else None,
+            "window_end": win["end"] if win else None,
+            "window_min_price": win["min_price"] if win else None,
+        }
+
+
+class SolarForecastThrottleMinutesToday(_BaseSensor):
+    """Cumulative minutes the production throttle switch has been ON today.
+
+    Useful for explaining why actuals fell short of the prediction.
+    """
+    _attr_icon = "mdi:speedometer-slow"
+    _attr_name = "Throttled minutes today"
+    _attr_native_unit_of_measurement = "min"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_throttle_minutes_today"
+
+    @property
+    def native_value(self):
+        t = (self.coordinator.data or {}).get("throttle") or {}
+        return t.get("minutes_today")
+
+    @property
+    def extra_state_attributes(self):
+        t = (self.coordinator.data or {}).get("throttle") or {}
+        return {
+            "active": t.get("active"),
+            "entity_id": t.get("entity_id"),
+            "state": t.get("state"),
         }
