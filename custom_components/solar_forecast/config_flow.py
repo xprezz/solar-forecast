@@ -139,12 +139,11 @@ class SolarForecastConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
-        return SolarForecastOptionsFlow(config_entry)
+        return SolarForecastOptionsFlow()
 
 
 class SolarForecastOptionsFlow(config_entries.OptionsFlow):
-    def __init__(self, config_entry):
-        self.config_entry = config_entry
+    """HA auto-injects `self.config_entry`; do not set it manually (deprecation -> error)."""
 
     async def async_step_init(self, user_input=None):
         if user_input is not None:

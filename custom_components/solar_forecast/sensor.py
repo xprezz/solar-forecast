@@ -44,7 +44,7 @@ class _BaseSensor(CoordinatorEntity, SensorEntity):
             name=entry.title,
             manufacturer="Solar Forecast",
             model="Linear weather model",
-            sw_version="2.1.0",
+            sw_version="2.1.1",
         )
 
 
