@@ -70,6 +70,21 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
         self._history = data.get("history", {})
         self._model = data.get("model", dict(DEFAULT_COEF))
         self._last_refit = data.get("last_refit")
+        # One-time cleanup: drop hourly_actual_kwh arrays where hour 0 holds a phantom
+        # pre-reset spike (pre-1.2.1 bug). Triggers re-backfill on next update.
+        cleaned = 0
+        for d_iso, rec in self._history.items():
+            ha = rec.get("hourly_actual_kwh")
+            if not isinstance(ha, list) or len(ha) < 24:
+                continue
+            v0 = ha[0] if ha[0] is not None else 0
+            rest_max = max((v for v in ha[1:] if v is not None), default=0)
+            if v0 >= 8 and v0 >= 2 * rest_max:
+                rec["hourly_actual_kwh"] = None
+                cleaned += 1
+        if cleaned:
+            _LOGGER.info("Cleared %d corrupted hourly_actual_kwh arrays (phantom spike at hour 0)", cleaned)
+            await self._save_storage()
         _LOGGER.info("Loaded %d historical days, model %s", len(self._history), self._model)
 
     async def async_backfill_hourly_actuals(self, days_back: int = 30) -> int:
@@ -504,7 +519,11 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
 
         # cumulative total for the day
         if daily_eid:
-            today_total = max(v for _, v in records)
+            # Daily counter resets at midnight. The recorder's include_start_time_state
+            # injects yesterday's final value as a phantom record at 00:00 today.
+            # The CURRENT cumulative is the LAST recorded value (sorted by timestamp).
+            records_sorted = sorted(records, key=lambda r: r[0])
+            today_total = records_sorted[-1][1] if records_sorted else 0.0
         else:
             today_total = max(0.0, records[-1][1] - records[0][1])
 
@@ -522,9 +541,17 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
         # convert to hourly kWh
         hourly_kwh_by_hour: dict[int, float] = {}
         if daily_eid:
+            # Discard the phantom pre-reset value at hour 0: if hour 0's recorded
+            # max is larger than the next hour with data, it's yesterday's residue.
+            sorted_h = sorted(hour_values.keys())
+            if (len(sorted_h) >= 2
+                    and sorted_h[0] == 0
+                    and hour_values[sorted_h[0]] > hour_values[sorted_h[1]]):
+                del hour_values[sorted_h[0]]
+                sorted_h = sorted_h[1:]
             # daily counter: hourly = diff between consecutive hours, clamp to >=0
             prev = 0.0
-            for h in sorted(hour_values.keys()):
+            for h in sorted_h:
                 cur = hour_values[h]
                 hourly_kwh_by_hour[h] = round(max(0.0, cur - prev), 2)
                 prev = cur
@@ -625,8 +652,16 @@ class SolarForecastCoordinator(DataUpdateCoordinator):
 
         result: list[float | None] = [None] * 24
         if daily_eid:
+            # Discard phantom pre-reset value at hour 0 (yesterday's residue injected
+            # by recorder's include_start_time_state).
+            sorted_h = sorted(hour_values.keys())
+            if (len(sorted_h) >= 2
+                    and sorted_h[0] == 0
+                    and hour_values[sorted_h[0]] > hour_values[sorted_h[1]]):
+                del hour_values[sorted_h[0]]
+                sorted_h = sorted_h[1:]
             prev = 0.0
-            for h in sorted(hour_values.keys()):
+            for h in sorted_h:
                 result[h] = round(max(0.0, hour_values[h] - prev), 2)
                 prev = hour_values[h]
         else:
